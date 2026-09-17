@@ -1,15 +1,17 @@
 openai==1.76.0
 uvicorn==0.34.2
 langchain==0.3.24
+langchain-core==0.3.55
 langchain-community==0.3.22
+langchain-openai==0.3.14
+langchain-experimental==0.3.4
+langchain-chroma==0.2.3
+chromadb==0.6.3
 fastapi==0.115.9
-chromadb==1.0.6
 pypdf==5.4.0
 python-dotenv==1.1.0
-unstructured==0.17.2
-langchain-openai==0.3.14
-langchain-chroma==0.2.3
 python-multipart==0.0.20
-langchain-experimental==0.3.4
-duckduckgo-search==8.0.1
 SQLAlchemy==2.0.40
+langgraph==1.2.11
+# duckduckgo-search==8.0.1
+# unstructured==0.17.2

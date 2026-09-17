@@ -176,10 +176,10 @@ const ChatPage = () => {
 
   const [agentMode, setAgentMode] = useState(true);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!input.trim() && !selectedFile) return;
 
-    // Add user message
+    // 添加用户消息
     const userMessage = {
       id: Date.now(),
       type: "user",
@@ -189,7 +189,7 @@ const ChatPage = () => {
     setInput("");
     setWaitingForReply(true);
 
-    // Create FormData to handle both text and files
+    // 构建 FormData
     const formData = new FormData();
     if (selectedFile) {
       formData.append("files", selectedFile);
@@ -197,31 +197,81 @@ const ChatPage = () => {
     formData.append("query", input);
     formData.append("agent", agentMode);
 
-    // Send message to the server using the combined endpoint
-    apiClient.post(`/chats/${currentChat}/send/`, formData)
-      .then(response => {
-        const agentMessage = response.data.agent_response;
-        setTimeout(() => {
-          setWaitingForReply(false);
-          setMessages(prevMessages => [...prevMessages, agentMessage]);
-          if (currentChat === "newChat") {
-            setCurrentChat(response.data.chat_id);
-            setChats(prevChats => [...prevChats, { id: response.data.chat_id, name: response.data.chat_name }]);
-          }
-        }, 150);
-      })
-      .catch(error => {
-        setWaitingForReply(false);
-        if (error.response && error.response.data && error.response.data.detail) {
-          setError(error.response.data.detail);
-        } else {
-          setError("Error sending message: " + (error.message || "Unknown error"));
-        }
-        console.error("Error sending message", error);
-      })
-      .finally(() => {
-        setSelectedFile(null); // Clear the file selection after sending
+    // ===== 流式调用 =====
+    try {
+      const response = await fetch(`/api/chats/${currentChat}/send/stream/`, {
+        method: 'POST',
+        body: formData,
       });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      // 创建占位 agent 消息
+      const agentMsgId = Date.now() + 1;
+      const placeholderMsg = {
+        id: agentMsgId,
+        type: "agent",
+        body: "",
+        reasoning_steps: []
+      };
+      setMessages(prev => [...prev, placeholderMsg]);
+
+      // 逐块读取 SSE 流
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullBody = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === 'content' && !data.done) {
+              // 追加文本
+              fullBody += data.content;
+              setMessages(prev => prev.map(msg =>
+                msg.id === agentMsgId ? { ...msg, body: fullBody } : msg
+              ));
+
+            } else if (data.type === 'reasoning') {
+              // 更新推理步骤
+              setMessages(prev => prev.map(msg =>
+                msg.id === agentMsgId ? { ...msg, reasoning_steps: data.steps } : msg
+              ));
+
+            } else if (data.type === 'done') {
+              // 流结束
+              if (data.chat_id && currentChat === "newChat") {
+                setCurrentChat(data.chat_id);
+                setChats(prevChats => [...prevChats, { id: data.chat_id, name: `Chat ${data.chat_id}` }]);
+              }
+            }
+          } catch (e) {
+            console.error('解析 SSE 数据失败:', e);
+          }
+        }
+      }
+    }
+
+      setWaitingForReply(false);
+    } catch (error) {
+      setWaitingForReply(false);
+      setError("流式请求失败: " + (error.message || "Unknown error"));
+      console.error("Error sending message (stream)", error);
+    } finally {
+      setSelectedFile(null);
+    }
   };
 
   const handleDeleteChat = (chatId) => {

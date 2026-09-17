@@ -503,6 +503,7 @@ body.dark-mode {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  scroll-behavior: smooth;
 }
 
 .message-wrapper {

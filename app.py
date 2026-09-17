@@ -4,7 +4,6 @@ import shutil
 from typing import List
 from fastapi import Depends
 from pydantic import BaseModel
-from agent import agent_executor
 from sqlalchemy.orm import Session
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
@@ -12,6 +11,11 @@ from database import get_db, DBChat, DBMessage
 from fastapi.middleware.cors import CORSMiddleware
 from vector_database import get_vector_db, process_files
 from fastapi import FastAPI, File, UploadFile, Form,HTTPException,status
+from agent_langgraph import agent_executor as lg_agent_executor
+from fastapi.responses import StreamingResponse
+from agent_langgraph import agent_stream as lg_agent_stream
+from agent_langgraph import agent_stream_events as lg_agent_stream_events
+from database import SessionLocal
 
 
 
@@ -170,13 +174,16 @@ async def send_chat_message(
     db.refresh(user_message)
     
     # Generate response
-    reasoning_steps = []
     if query and query != "":
-        response = agent_executor(query_text=query, agent=agent)
-        final_response = response['response']  
-        if response['sources']:
-            final_response += '\n\nSources:\n' + "\n".join(response['sources'])
-        reasoning_steps = response['reasoning_steps']
+        result = lg_agent_executor(query_text=query, chat_id=str(chat_id))
+
+        final_response = result["response"]
+        sources = result.get("sources", [])
+
+        if sources:
+            final_response += '\n\nSources:\n' + "\n".join(sources)
+
+        reasoning_steps = []
         
     elif files:
         # If only files were uploaded with no query
@@ -203,3 +210,94 @@ async def send_chat_message(
         'chat_id': chat_id,
         'chat_name': chat.name
     })
+
+
+@app.post("/api/chats/{chat_id}/send/stream/")
+async def send_chat_message_stream(
+    chat_id: str,
+    query: str = Form(default=""),
+    files: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+):
+    # 既没文字也没文件 → 400
+    if (not query or not query.strip()) and (not files):
+        return JSONResponse(content={"error": "Empty query and no files"}, status_code=400)
+
+    # 解析 chat_id
+    if chat_id == 'newChat':
+        nc = DBChat(name="New Chat")
+        db.add(nc); db.commit(); db.refresh(nc)
+        actual = str(nc.id)
+    else:
+        try:
+            actual = str(int(chat_id))
+            if not db.query(DBChat).filter(DBChat.id == int(actual)).first():
+                raise HTTPException(status_code=404, detail="Chat not found")
+        except ValueError:
+            return JSONResponse(content={"error": "Invalid chat ID"}, status_code=400)
+
+    # 存用户消息
+    if query and query.strip():
+        db.add(DBMessage(chat_id=int(actual), type="user", body=query))
+    elif files:
+        db.add(DBMessage(chat_id=int(actual), type="user", body="Files uploaded"))
+    db.commit()
+
+    # 处理上传文件
+    files_paths = []
+    if files:
+        folder = os.path.join(UPLOAD_FOLDER, actual)
+        os.makedirs(folder, exist_ok=True)
+        for f in files:
+            if not f.filename.endswith(('.txt', '.pdf', '.docx')):
+                return JSONResponse(content={"error": "Invalid file type"}, status_code=400)
+            fp = os.path.join(folder, f.filename)
+            files_paths.append(fp)
+            with open(fp, "wb") as out:
+                shutil.copyfileobj(f.file, out)
+
+        ok, msg = process_files(files_paths=files_paths)
+        if not ok:
+            return JSONResponse(content={"error": msg}, status_code=500)
+
+        # 不走 LLM，直接 SSE 回个结果
+        if not query or not query.strip():
+            def only_upload():
+                yield f"data: {json.dumps({'type':'content','content':msg,'done':False}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type':'done','content':'','done':True,'chat_id':actual}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(only_upload(), media_type="text/event-stream")
+
+    # 有 query → 走流式 agent
+    def generate():
+        dg = SessionLocal()
+        full = ""
+        steps = []
+
+        # 如果有新上传的文件，给 query 加上下文提示，强制 Agent 检索
+        effective_query = query
+        if files:
+            effective_query = (
+                "[系统提示：用户刚刚上传了文件并已成功处理到知识库中。"
+                "你必须使用 retrieve 工具检索相关内容来回答以下问题，不要说没有文档。]\n\n"
+                f"{query}"
+            )
+
+        try:
+            for ev in lg_agent_stream_events(effective_query, chat_id=actual):
+                if ev["type"] == "content":
+                    full += ev["content"]
+                    yield f"data: {json.dumps({'type':'content','content':ev['content'],'done':False}, ensure_ascii=False)}\n\n"
+                elif ev["type"] == "step_start":
+                    steps.append({"action": {"tool": ev["tool"], "tool_input": ev.get("input",""), "log":""}, "observation": "执行中..."})
+                    yield f"data: {json.dumps({'type':'reasoning','steps':steps}, ensure_ascii=False)}\n\n"
+                elif ev["type"] == "step_end":
+                    if steps:
+                        steps[-1]["observation"] = ev.get("output","")
+                    yield f"data: {json.dumps({'type':'reasoning','steps':steps}, ensure_ascii=False)}\n\n"
+            am = DBMessage(chat_id=int(actual), type="agent", body=full, reasoning_steps=json.dumps(steps))
+            dg.add(am); dg.commit()
+            yield f"data: {json.dumps({'type':'done','content':'','done':True,'chat_id':actual}, ensure_ascii=False)}\n\n"
+        finally:
+            dg.close()
+
+    return StreamingResponse(generate(), media_type="text/event-stream")

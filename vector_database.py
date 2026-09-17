@@ -2,17 +2,23 @@ import os
 import openai 
 import shutil
 from dotenv import load_dotenv
-from langchain_community.document_loaders import DirectoryLoader,TextLoader, PyPDFLoader, UnstructuredMarkdownLoader
+from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 from typing import Optional
 
 load_dotenv()
-openai.api_key=os.environ.get('OPENAI_API_KEY')
+def get_embeddings():
+    """统一创建走中转的 Embeddings 实例"""
+    return OpenAIEmbeddings(
+        model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE"),
+    )
+
 CHROMA_PATH='chroma_db'
 
-# Global variable for vector database
 _vector_db = None
 
 def get_vector_db():
@@ -24,7 +30,7 @@ def get_vector_db():
         if os.path.exists(CHROMA_PATH):
             _vector_db = Chroma(
                 persist_directory=CHROMA_PATH,
-                embedding_function=OpenAIEmbeddings()
+                embedding_function=get_embeddings()
             )
             print(f"Loaded existing vector database from {CHROMA_PATH}")
         else:
@@ -48,7 +54,7 @@ def save_chomadb(chunks, overwrite=False):
         # Create new DB
         _vector_db = Chroma.from_documents(
             chunks, 
-            OpenAIEmbeddings(),
+            get_embeddings(),
             persist_directory=CHROMA_PATH
         )
         print(f"Created new vector database with {len(chunks)} chunks.")
@@ -59,7 +65,7 @@ def save_chomadb(chunks, overwrite=False):
     
     return _vector_db
 
-def query_data(query_text: str, similarity_threshold: float = 0.7, k: int = 3):    
+def query_data(query_text: str, similarity_threshold: float = -0.5, k: int = 3):
     # Use the global vector db instance
     vector_db = get_vector_db()
     
@@ -94,7 +100,7 @@ def load_documents(files_paths:list):
         if file_path.endswith('.pdf'):
             loader = PyPDFLoader(file_path)
         elif file_path.endswith('.md'):
-            loader = UnstructuredMarkdownLoader(file_path)
+            loader = TextLoader(file_path, encoding='utf-8')
         elif file_path.endswith('.txt'):
             # Try with UTF-8 encoding first, fallback to other encodings if needed
             try:
